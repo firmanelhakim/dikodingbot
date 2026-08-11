@@ -1,0 +1,34 @@
+# Environment files (real config + timestamped backups) - never commit.
+.env*
+
+# Timestamped backup rotations of any file (bot.py.bak-20260101-120000, …).
+*.bak-*
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Runtime state written by the bot itself.
+sessions.json
+sessions-test.json
+active_model.txt
+active_permission.txt
+
+# Editors / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
