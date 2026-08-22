@@ -92,8 +92,11 @@ Once running, open Telegram, find your bot, and send:
 | `/perm [mode]` | Show or switch the Claude permission mode (`dontAsk` default; also `bypassPermissions`, `plan`) |
 | `/status` | Show the running task's PID, elapsed time, and prompt preview |
 | `/cancel` | Terminate the running Claude process group |
-| `/code` | Send the whole source tree as a timestamped ZIP |
-| `/code <file>` | Send a single source file (e.g. `/code runner.py`) |
+| `/list` | List files in the active workspace (directories first, then files) |
+| `/list <subdir>` | List a subfolder of the active workspace |
+| `/list -r [n]` | List recursively, `n` levels down from the start (default 2, max 6; prunes `.git`, `venv/`, `node_modules/`, caches) |
+| `/code` | Send the active workspace as a timestamped ZIP (secrets, runtime state, caches, and backups excluded) |
+| `/code <file>` | Send a single file from the active workspace |
 | `/help` | Command menu |
 
 Session state per workspace means: after `/switch project-a`, any prompt continues the Claude conversation you had in `project-a` last time; `/switch project-b` picks up wherever you left off there.
@@ -143,7 +146,7 @@ This bot is deliberately built for a **single trusted operator on a trusted mach
 - ✅ Every incoming update is authorized against `ALLOWED_USER_ID`. `0` means "reject everyone."
 - ✅ `/switch` cannot escape `BASE_DIR` (verified via `os.path.commonpath`).
 - ✅ Uploads strip client-supplied path components, refuse to overwrite, and enforce `MAX_UPLOAD_BYTES`.
-- ✅ `/code` ships only an explicit allowlist of project files (source modules, docs, and `tests/*.py`) - never `.env`, `sessions.json`, `active_model.txt`, `*.bak-*`, or `venv/`.
+- ✅ `/code` zips the active workspace but never `.env`, `sessions.json`, `active_model.txt`, `active_permission.txt`, `*.bak-*` rotations, or `venv/` and cache directories - even when those are named explicitly.
 - ⚠️ Claude runs with a configurable permission mode, default **`dontAsk`** (autonomous for normal operations, blocks destructive actions unless allowlisted). Switching to `bypassPermissions` via `/perm` or `PERMISSION_MODE` grants full local execution authority - the startup banner prints the active mode.
 - ⚠️ There is **no rate limiting** - an authorized user can trigger unbounded runs.
 

@@ -76,9 +76,10 @@ def main() -> None:
     app.add_handler(CommandHandler("perm", handlers.make_permission_command(state)))
     app.add_handler(CommandHandler("status", handlers.make_status_command(state), block=False))
     app.add_handler(CommandHandler("cancel", handlers.make_cancel_command(), block=False))
+    app.add_handler(CommandHandler("list", handlers.make_list_command(state)))
     app.add_handler(CommandHandler("help", handlers.help_command))
     app.add_handler(CommandHandler("start", handlers.help_command))
-    app.add_handler(CommandHandler("code", handlers.send_code))
+    app.add_handler(CommandHandler("code", handlers.make_code_command(state)))
     app.add_handler(MessageHandler(filters.Document.ALL, handlers.make_document_handler(state)))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.make_message_handler(state))

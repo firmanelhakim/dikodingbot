@@ -484,6 +484,161 @@ def make_cancel_command():
     return cancel_command
 
 
+# --- /list ---------------------------------------------------------------
+
+# Default depth for ``-r``, counted from the starting folder: level 1 is the
+# folder's own entries, level 2 adds each immediate subfolder's entries. An
+# explicit depth on the command line overrides this, up to _LIST_MAX_DEPTH.
+_LIST_RECURSE_DEPTH = 2
+_LIST_MAX_DEPTH = 6
+
+# Cap on entry lines so a dense workspace can't dump a wall of text onto the
+# phone; send_chunks would otherwise deliver all of it.
+_LIST_LINE_LIMIT = 5000
+
+# Directories /list never descends into. They still show as a name, but their
+# contents are noise (a git object store, a virtualenv, node_modules).
+_LIST_EXCLUDED_DIRS = frozenset(
+    {".git", "venv", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+)
+
+def _parse_list_args(args: list[str]) -> tuple[str | None, bool, int, str | None]:
+    """Parse ``/list`` arguments into ``(subdir, recursive, depth, error)``.
+
+    ``-r`` may appear in either position, and ``depth`` (a bare integer)
+    follows it when present. Any other flag, more than one positional
+    argument, or a non-integer depth is an error.
+    """
+    subdir = None
+    recursive = False
+    depth = _LIST_RECURSE_DEPTH
+    for arg in args:
+        if arg == "-r":
+            recursive = True
+        elif arg.startswith("-"):
+            return None, False, depth, "Unknown flag. Usage: /list [-r] [subdir]"
+        elif arg.isdigit():
+            # A bare integer is a depth override. It only applies to -r; the
+            # handler clamps it and validates it against _LIST_MAX_DEPTH.
+            depth = int(arg)
+        elif subdir is None:
+            subdir = arg
+        else:
+            return None, False, depth, "Only one subfolder can be listed at a time."
+    return subdir, recursive, depth, None
+
+def _resolve_list_target(subdir: str | None, active_dir: str) -> tuple[str | None, str | None]:
+    """Resolve a /list target to an absolute path inside ``active_dir``.
+
+    Returns ``(path, error)`` with exactly one of the two set. The target is
+    confined to the active workspace via realpath, so a symlink pointing
+    outside it is rejected rather than walked.
+    """
+    target = active_dir if subdir is None else os.path.abspath(os.path.join(active_dir, subdir))
+    real_active = os.path.realpath(active_dir)
+    real_target = os.path.realpath(target)
+    try:
+        within = (
+            os.path.normcase(os.path.commonpath([real_target, real_active]))
+            == os.path.normcase(real_active)
+        )
+    except ValueError:
+        within = False
+    if not within:
+        return None, "Invalid path: listing is confined to the active workspace."
+    if not os.path.isdir(real_target):
+        return None, "That path is not a folder in the active workspace."
+    return real_target, None
+
+def _list_entries(path: str) -> tuple[list[str], list[str]]:
+    """Return ``(dir_names, file_names)`` inside ``path``, each sorted.
+
+    Symlinks are not followed: a symlink to a directory is listed as a file
+    rather than descended into, so a link pointing outside the workspace can't
+    pull the walk off-root.
+    """
+    dirs: list[str] = []
+    files: list[str] = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        dirs.append(entry.name)
+                    else:
+                        files.append(entry.name)
+                except OSError:
+                    continue
+    except OSError as e:
+        log.warning("Could not list %s: %s", path, e)
+    dirs.sort()
+    files.sort()
+    return dirs, files
+
+def _build_listing(root: str, depth: int, line_limit: int) -> str:
+    """Build a text listing of ``root``, recursing up to ``depth`` levels.
+
+    Depth 1 lists only ``root``'s entries; depth 2 also lists each immediate
+    subfolder's entries. Directories are marked with a trailing slash and
+    listed before files, so the layout reads top to bottom like ``tree``.
+    """
+    body: list[str] = []
+    truncated = [False]
+
+    def _append(line: str) -> bool:
+        if len(body) >= line_limit:
+            truncated[0] = True
+            return False
+        body.append(line)
+        return True
+
+    def _walk(path: str, remaining: int, indent: str) -> None:
+        dirs, files = _list_entries(path)
+        for d in dirs:
+            if not _append(f"{indent}{d}/"):
+                return
+            if remaining > 1 and d not in _LIST_EXCLUDED_DIRS:
+                _walk(os.path.join(path, d), remaining - 1, indent + "  ")
+                if truncated[0]:
+                    return
+        for f in files:
+            if not _append(f"{indent}{f}"):
+                return
+
+    _walk(root, depth, "")
+    if truncated[0]:
+        body.append(f"[... truncated after {line_limit} lines]")
+    return "\n".join([f"📁 {root}"] + body)
+
+def make_list_command(state: AppState):
+    async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not authorized(update):
+            await update.message.reply_text("⛔ Unauthorized")
+            return
+
+        subdir, recursive, depth, error = _parse_list_args(context.args or [])
+        if error:
+            await update.message.reply_text(error)
+            return
+
+        # A depth is only meaningful with -r; without it the top level is
+        # listed regardless. Clamp out-of-range values rather than erroring on
+        # a harmless typo.
+        if not recursive:
+            depth = 1
+        else:
+            depth = max(1, min(depth, _LIST_MAX_DEPTH))
+
+        target, error = _resolve_list_target(subdir, state.active_dir)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        text = _build_listing(target, depth, _LIST_LINE_LIMIT)
+        await telegram_io.send_chunks(update, text)
+
+    return list_command
+
 # The /help output. HTML formatting keeps it consistent with send_chunks.
 HELP_HTML = (
     "🤖 <b>dikodingbot Command Menu</b>\n\n"
@@ -494,8 +649,11 @@ HELP_HTML = (
     "• <code>/perm [mode]</code> - Show or switch the Claude permission mode (default <code>dontAsk</code>).\n"
     "• <code>/status</code> - Show the running task's PID, elapsed time, and prompt.\n"
     "• <code>/cancel</code> - Stop the currently running task.\n"
-    "• <code>/code</code> - Send the whole source tree as a ZIP.\n"
-    "• <code>/code &lt;file&gt;</code> - Send a single source file (e.g. <code>/code runner.py</code>).\n"
+    "• <code>/list</code> - List files in the active workspace.\n"
+    "• <code>/list &lt;subdir&gt;</code> - List a subfolder of the active workspace.\n"
+    "• <code>/list -r [n]</code> - List recursively (n levels down, default 2).\n"
+    "• <code>/code</code> - Send the active workspace as a ZIP.\n"
+    "• <code>/code &lt;file&gt;</code> - Send a single file from the active workspace.\n"
     "• <code>/help</code> - Display this command menu.\n\n"
     "💬 <b>Prompting:</b> Send plain text to instruct Claude Code (context is saved per workspace).\n\n"
     "📎 <b>Uploads:</b> Send any file/document to upload it directly to your active workspace."
@@ -509,157 +667,175 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await telegram_io.send_html(update, HELP_HTML)
 
 
-# The directory that holds this module - the bot's source root.
-_SRC_ROOT = os.path.abspath(os.path.dirname(__file__))
+# --- /code ---------------------------------------------------------------
 
-# Explicit allowlist for /code: what counts as "the source" and is safe to
-# send. Anything not listed - .env, sessions.json, active_model.txt, *.bak-*,
-# __pycache__/, .github/, venv/ - never enters the ZIP.
-#
-# Root-level items are file names; ``tests`` is a directory walked recursively
-# but limited to ``*.py``. Missing entries are skipped without complaint so a
-# partial clone (no LICENSE, say) still works.
-_CODE_ROOT_FILES = (
-    # Python sources.
-    "bot.py",
-    "config.py",
-    "handlers.py",
-    "runner.py",
-    "session_store.py",
-    "state.py",
-    "telegram_io.py",
-    "auth.py",
-    "models.py",
-    # Docs / config templates.
-    "requirements.txt",
-    "README.md",
-    "LICENSE",
-    ".env.example",
-    ".gitignore",
+# Directories never included in a workspace snapshot. _LIST_EXCLUDED_DIRS is
+# the /list prune set; the ZIP also drops editor and tool caches.
+_CODE_EXCLUDED_DIRS = _LIST_EXCLUDED_DIRS | frozenset(
+    {".mypy_cache", ".ruff_cache", ".idea", ".vscode"}
 )
-_CODE_TESTS_DIR = "tests"
 
-# Size cap. The ZIP is normally around 30 KB, so anything near 20 MB means
-# something unexpected got included; fail loudly instead of sending it.
+# Files never shipped by /code, at any depth. Secrets and runtime state only;
+# the template .env.example is left in on purpose so a fresh clone can copy it.
+_CODE_EXCLUDED_FILES = frozenset(
+    {
+        ".env",
+        "sessions.json",
+        "sessions-test.json",
+        "active_model.txt",
+        "active_permission.txt",
+    }
+)
+
+# Size cap. Telegram's document limit is 50 MB, so 20 MB leaves headroom; a
+# snapshot that big almost always means something bulky slipped through.
 _CODE_ZIP_SIZE_LIMIT = 20 * 1024 * 1024
 
 
-def _collect_code_files() -> list[tuple[str, str]]:
-    """Return ``(absolute_path, arcname)`` pairs for the /code snapshot.
+def _is_excluded_file(name: str) -> bool:
+    """True for secret / runtime files and the backup rotations, matching
+    ``.gitignore`` (``.env*`` is handled by exact name, not a blanket pattern,
+    so the safe ``.env.example`` still ships)."""
+    if name in _CODE_EXCLUDED_FILES:
+        return True
+    return ".bak-" in name or name.endswith(".bak")
 
-    ``arcname`` is the path inside the ZIP, relative to the project root, so
-    the archive extracts into the same layout.
+
+def _collect_workspace_files(root: str) -> list[tuple[str, str]]:
+    """Return ``(absolute_path, arcname)`` pairs for a workspace snapshot.
+
+    ``arcname`` is relative to ``root`` so the archive extracts into the same
+    layout. Excluded directories are pruned before walking into them, excluded
+    files are skipped, and symlinks are never followed - a link pointing
+    outside the workspace must not pull external files into the ZIP.
     """
     entries: list[tuple[str, str]] = []
-    for name in _CODE_ROOT_FILES:
-        abs_path = os.path.join(_SRC_ROOT, name)
-        if os.path.isfile(abs_path):
-            entries.append((abs_path, name))
-
-    tests_dir = os.path.join(_SRC_ROOT, _CODE_TESTS_DIR)
-    if os.path.isdir(tests_dir):
-        for dirpath, _dirnames, filenames in os.walk(tests_dir):
-            # Skip caches even if they were somehow untracked.
-            if os.path.basename(dirpath) == "__pycache__":
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = sorted(
+            d
+            for d in dirnames
+            if d not in _CODE_EXCLUDED_DIRS
+            and not os.path.islink(os.path.join(dirpath, d))
+        )
+        for fname in sorted(filenames):
+            abs_path = os.path.join(dirpath, fname)
+            if os.path.islink(abs_path):
                 continue
-            for fname in sorted(filenames):
-                if not fname.endswith(".py"):
-                    continue
-                abs_path = os.path.join(dirpath, fname)
-                rel = os.path.relpath(abs_path, _SRC_ROOT)
-                entries.append((abs_path, rel))
+            if _is_excluded_file(fname):
+                continue
+            entries.append((abs_path, os.path.relpath(abs_path, root)))
+    entries.sort(key=lambda e: e[1])
     return entries
 
 
-def _build_source_zip() -> bytes:
-    """Build the /code snapshot ZIP in memory."""
+def _build_workspace_zip(entries: list[tuple[str, str]]) -> bytes:
+    """Build the /code snapshot ZIP in memory from collected entries."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for abs_path, arcname in _collect_code_files():
+        for abs_path, arcname in entries:
             zf.write(abs_path, arcname=arcname)
     return buf.getvalue()
 
 
-def _resolve_single_code_file(arg: str) -> str | None:
-    """Map a ``/code <arg>`` request to an absolute path inside the source root.
+def _resolve_code_file(root: str, arg: str) -> tuple[str | None, str | None]:
+    """Map a ``/code <arg>`` request to an absolute path inside the workspace.
 
-    Returns None when the request is malformed, points outside the root, or
-    isn't on the allowlist. ``os.path.basename`` handles ``../`` and absolute
-    paths before we touch the filesystem.
+    Returns ``(path, error)`` with exactly one set. The path is confined to
+    the workspace via realpath, symlinks are refused, and excluded files stay
+    blocked even when named explicitly.
     """
-    # ``basename`` drops any directory part - /code ../../.env becomes just
-    # ".env", which the allowlist then rejects.
-    safe = os.path.basename(arg.strip())
-    if not safe or safe in (".", ".."):
-        return None
+    requested = arg.strip()
+    if not requested or requested in (".", ".."):
+        return None, "No such file."
 
-    if safe in _CODE_ROOT_FILES:
-        candidate = os.path.join(_SRC_ROOT, safe)
-        return candidate if os.path.isfile(candidate) else None
+    target = os.path.abspath(os.path.join(root, requested))
+    real_root = os.path.realpath(root)
+    real_target = os.path.realpath(target)
+    try:
+        within = (
+            os.path.normcase(os.path.commonpath([real_target, real_root]))
+            == os.path.normcase(real_root)
+        )
+    except ValueError:
+        within = False
+    if not within:
+        return None, "Outside the active workspace."
 
-    # Also accept "tests/<name>.py" and a bare "test_foo.py" for convenience.
-    if safe.endswith(".py"):
-        tests_dir = os.path.join(_SRC_ROOT, _CODE_TESTS_DIR)
-        candidate = os.path.join(tests_dir, safe)
-        if os.path.isfile(candidate):
-            return candidate
+    if os.path.islink(target):
+        return None, "That path is a symlink."
+    if not os.path.isfile(target):
+        return None, "Not a regular file in the workspace."
+    if _is_excluded_file(os.path.basename(target)):
+        return None, "That file is excluded."
+    return target, None
 
-    return None
 
+def make_code_command(state: AppState):
+    async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not authorized(update):
+            await update.message.reply_text("⛔ Unauthorized")
+            return
 
-async def send_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not authorized(update):
-        await update.message.reply_text("⛔ Unauthorized")
-        return
-
-    # /code <file> - single-file variant.
-    if context.args:
-        requested = context.args[0]
-        abs_path = _resolve_single_code_file(requested)
-        if abs_path is None:
+        root = state.active_dir
+        if not os.path.isdir(root):
             await update.message.reply_text(
-                f"❌ '{requested}' is not part of the source tree. "
-                "Use /code (no arg) to get the full ZIP, or one of the "
-                "listed source files (see /help)."
+                f"📂 Active workspace {root} not found."
             )
             return
-        filename = os.path.basename(abs_path)
-        await telegram_io.send_html(update, f"📄 Sending <code>{filename}</code>...")
-        with open(abs_path, "rb") as fh:
-            await update.message.reply_document(
-                document=fh,
-                filename=filename,
-                caption=f"{filename} from dikodingbot source.",
+
+        # /code <file> - single-file variant, confined to the active workspace.
+        if context.args:
+            requested = context.args[0]
+            abs_path, error = _resolve_code_file(root, requested)
+            if error:
+                await update.message.reply_text(f"❌ '{requested}': {error}")
+                return
+            filename = os.path.basename(abs_path)
+            await telegram_io.send_html(update, f"📄 Sending <code>{filename}</code>...")
+            try:
+                with open(abs_path, "rb") as fh:
+                    await update.message.reply_document(
+                        document=fh,
+                        filename=filename,
+                        caption=f"{filename} from {root}.",
+                    )
+            except OSError as e:
+                log.exception("code_command: file read failed")
+                await update.message.reply_text(f"❌ Could not read {filename}: {e}")
+            return
+
+        # /code - full workspace ZIP built in-memory.
+        entries = _collect_workspace_files(root)
+        if not entries:
+            await update.message.reply_text("📂 No files in the active workspace.")
+            return
+
+        try:
+            payload = _build_workspace_zip(entries)
+        except OSError as e:
+            log.exception("code_command: zip build failed")
+            await update.message.reply_text(f"❌ Could not build workspace ZIP: {e}")
+            return
+
+        if len(payload) > _CODE_ZIP_SIZE_LIMIT:
+            await update.message.reply_text(
+                f"❌ Workspace ZIP is unexpectedly large ({len(payload)} bytes); "
+                "refusing to send."
             )
-        return
+            return
 
-    # /code - full source ZIP built in-memory.
-    try:
-        payload = _build_source_zip()
-    except OSError as e:
-        log.exception("send_code: zip build failed")
-        await update.message.reply_text(f"❌ Could not build source ZIP: {e}")
-        return
+        # Timestamp so the operator can tell snapshots apart on their phone.
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        zip_name = f"{os.path.basename(os.path.normpath(root))}-{stamp}.zip"
 
-    if len(payload) > _CODE_ZIP_SIZE_LIMIT:
-        # Something unexpected got in - report it instead of sending an
-        # archive this big.
-        await update.message.reply_text(
-            f"❌ Source ZIP is unexpectedly large ({len(payload)} bytes); refusing to send. "
-            "Check for stray non-source files in the project root."
+        await telegram_io.send_html(
+            update,
+            f"📦 Sending workspace snapshot as <code>{zip_name}</code>...",
         )
-        return
+        await update.message.reply_document(
+            document=io.BytesIO(payload),
+            filename=zip_name,
+            caption=f"Snapshot of {root}.",
+        )
 
-    # Timestamp so the operator can tell snapshots apart on their phone.
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    zip_name = f"dikodingbot-{stamp}.zip"
-
-    await telegram_io.send_html(
-        update,
-        f"📦 Sending source snapshot as <code>{zip_name}</code>...",
-    )
-    await update.message.reply_document(
-        document=io.BytesIO(payload),
-        filename=zip_name,
-        caption="Full dikodingbot source tree.",
-    )
+    return code_command

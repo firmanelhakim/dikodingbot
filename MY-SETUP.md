@@ -200,14 +200,15 @@ strangers.
 Send `/setcommands`, pick the bot, and paste this list verbatim:
 
 ```
-projects - List workspaces in BASE_DIR
-switch - Switch the active workspace
-reset - Clear the session for the active workspace
-model - Show or switch the active model
-perm - Show or switch the permission mode
-status - Show the running task
-cancel - Stop the running task
-code - Send source as a ZIP or a single file
+projects - List folders in BASE_DIR; active one is marked
+switch - Switch active workspace: /switch <folder>
+reset - Clear conversation memory for a fresh start
+model - Show or switch active Claude model: /model [name]
+perm - Show or switch permission mode: /perm [dontAsk|bypassPermissions|plan]
+status - Show running task PID, elapsed time, and prompt
+cancel - Terminate the running Claude process
+list - List files in the active workspace
+code - Send active workspace as ZIP, or /code <file> for one file
 help - Show the command menu
 ```
 
