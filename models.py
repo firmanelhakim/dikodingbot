@@ -67,6 +67,37 @@ def save_active_model(model: str) -> None:
         log.error("Failed to save model to %s: %s", config.MODEL_FILE, e)
 
 
+def load_model_overrides() -> dict[str, str]:
+    """Load the per-folder model map from disk on startup.
+
+    Same shape and error tolerance as the other JSON maps: missing or corrupt
+    files give an empty dict.
+    """
+    if not os.path.exists(config.MODELS_FILE):
+        return {}
+    try:
+        with open(config.MODELS_FILE, "r") as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                log.warning("%s did not contain a dict; ignoring.", config.MODELS_FILE)
+                return {}
+            return data
+    except (OSError, json.JSONDecodeError) as e:
+        log.warning("Could not read %s: %s", config.MODELS_FILE, e)
+        return {}
+
+
+def save_model_overrides(overrides: dict[str, str]) -> None:
+    """Atomically persist the per-folder model map."""
+    tmp = config.MODELS_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(overrides, f, indent=2)
+        os.replace(tmp, config.MODELS_FILE)
+    except OSError as e:
+        log.error("Failed to save model overrides to %s: %s", config.MODELS_FILE, e)
+
+
 def fetch_models(force: bool = False) -> tuple[list[dict], str | None]:
     """Return ``(models, error)`` from the router.
 

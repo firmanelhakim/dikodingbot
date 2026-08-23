@@ -1,8 +1,9 @@
-"""In-flight subprocess record.
+"""In-flight subprocess records and per-folder locks.
 
-``current_run`` holds a reference to the running Claude process so ``/status``
-and ``/cancel`` can inspect it without acquiring ``claude_lock`` (which is held
-for the entire duration of a run).
+``runs`` maps a workspace directory to the Claude process running there, so
+``/status`` and ``/cancel`` can inspect a run without acquiring its lock. One
+lock per directory lets two topics work in parallel while two prompts aimed at
+the same folder still serialize.
 """
 
 from __future__ import annotations
@@ -45,9 +46,26 @@ class RunState:
         self.start_time = start_time
 
 
-# Shared single instance. runner writes it; status/cancel handlers read it.
-current_run = RunState()
+# Shared instances. runner writes to ``runs``; status/cancel handlers read it.
+# Each folder gets its own slot and lock so different topics run concurrently.
+runs: dict[str, RunState] = {}
 
-# Only one claude run at a time, so concurrent updates can't start two
-# ``--resume`` calls on the same session or change workspace mid-run.
-claude_lock = asyncio.Lock()
+# Per-folder locks. Locks are created lazily and never removed, which is fine:
+# there is one per workspace directory, not per run.
+_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_lock(run_dir: str) -> asyncio.Lock:
+    """Return the lock for ``run_dir``, creating it on first use."""
+    lock = _locks.get(run_dir)
+    if lock is None:
+        lock = _locks[run_dir] = asyncio.Lock()
+    return lock
+
+
+def get_run(run_dir: str) -> RunState:
+    """Return the (possibly empty) run record for ``run_dir``."""
+    run = runs.get(run_dir)
+    if run is None:
+        run = runs[run_dir] = RunState()
+    return run

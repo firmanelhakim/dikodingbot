@@ -57,6 +57,32 @@ class _FakeUpdate:
         self.message = message
 
 
+class _ChattyMessage:
+    """A message that carries a chat id, so the pacing bucket can key on it."""
+
+    def __init__(self, chat_id):
+        self._chat_id = chat_id
+        self.sent = []
+
+    @property
+    def chat_id(self):
+        return self._chat_id
+
+    async def reply_text(self, text, parse_mode=None):
+        self.sent.append((text, parse_mode))
+
+
+class _ChattyUpdate:
+    """An update whose ``effective_message`` exposes a chat id for pacing."""
+
+    def __init__(self, chat_id):
+        self.message = _ChattyMessage(chat_id)
+
+    @property
+    def effective_message(self):
+        return self.message
+
+
 def _no_sleep(test_case, io_mod):
     """Patch out the retry waits so tests don't actually sleep.
 
@@ -174,6 +200,73 @@ class RateLimitConfigTests(unittest.TestCase):
         io_mod = _fresh_io({"LIVE_EDIT_INTERVAL": "6.5", "SEND_MAX_RETRIES": "5"})
         self.assertEqual(io_mod.config.LIVE_EDIT_INTERVAL, 6.5)
         self.assertEqual(io_mod.config.SEND_MAX_RETRIES, 5)
+
+
+class PacingTests(unittest.TestCase):
+    """The shared token bucket. One run should never wait; many sends in one
+    chat are throttled; different chats get separate budgets."""
+
+    def setUp(self):
+        self.io = _fresh_io()
+        self.now = 0.0
+
+    def _clock(self):
+        return self.now
+
+    def test_pace_noops_when_the_update_has_no_chat_id(self):
+        # _FakeUpdate wraps _FakeMessage, which has no chat_id -> nothing to
+        # pace, and no exception.
+        asyncio.run(self.io._pace(_FakeUpdate(_FakeMessage())))
+
+    def test_bucket_is_shared_per_chat(self):
+        self.assertIs(self.io.get_bucket(7), self.io.get_bucket(7))
+        self.assertIsNot(self.io.get_bucket(7), self.io.get_bucket(8))
+
+    def test_refill_caps_at_burst(self):
+        # A long idle gap must refill only up to the burst ceiling, never more.
+        bucket = self.io._TokenBucket(rate=1.0, burst=5.0)
+        bucket._tokens = 0.0
+        bucket._updated = 0.0
+        bucket._refill(1000.0)
+        self.assertEqual(bucket._tokens, 5.0)
+
+    def test_refill_grows_proportionally_to_elapsed(self):
+        # rate is tokens/minute here; 30s of a 60s token is half a token.
+        bucket = self.io._TokenBucket(rate=1.0, burst=5.0)
+        bucket._tokens = 0.0
+        bucket._updated = 0.0
+        bucket._refill(30.0)
+        self.assertAlmostEqual(bucket._tokens, 0.5, places=6)
+
+    def test_pace_consumes_one_token(self):
+        with patch.object(self.io, "_now", self._clock):
+            asyncio.run(self.io._pace(_ChattyUpdate(chat_id=5)))
+        bucket = self.io.get_bucket(5)
+        self.assertAlmostEqual(
+            bucket._tokens, self.io.config.SEND_RATE_BURST - 1, places=6
+        )
+
+    def test_acquire_waits_when_empty_then_returns(self):
+        # Empty bucket: acquire sleeps until the clock has advanced enough to
+        # refill one token, then returns. The fake clock + fake sleep make this
+        # deterministic instead of waiting a real minute.
+        bucket = self.io._TokenBucket(rate=1.0, burst=1.0)  # 1 token / 60s
+        bucket._tokens = 0.0
+        bucket._updated = 0.0
+
+        real_sleep = asyncio.sleep
+
+        async def _advance_sleep(delay):
+            self.now += delay
+            await real_sleep(0)
+
+        with patch.object(self.io, "_now", self._clock):
+            with patch.object(self.io.asyncio, "sleep", _advance_sleep):
+                asyncio.run(bucket.acquire())
+        # One full minute of fake time refilled exactly one token, which was
+        # then consumed.
+        self.assertAlmostEqual(bucket._tokens, 0.0, places=6)
+        self.assertGreaterEqual(self.now, 60.0)
 
 
 if __name__ == "__main__":

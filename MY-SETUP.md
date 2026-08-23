@@ -51,7 +51,8 @@ Four moving parts, in order of what they do:
 
 The last two live in gitignored runtime files (`active_model.txt` and
 `active_permission.txt`), not in `.env`, so they change as I use `/model` and
-`/perm` and are not part of the repo.
+`/perm` and are not part of the repo. Per-folder overrides set from inside a
+topic live in `models.json` and `permissions.json`, also gitignored.
 
 ## Workspace layout
 
@@ -66,6 +67,35 @@ dikodingbot/      this repo; also a switchable workspace
 
 Because `dikodingbot/` is itself a workspace under `BASE_DIR`, I can `/switch
 dikodingbot` and have Claude Code work on its own source.
+
+## Forum topics (one project per topic)
+
+The bot can also work inside a forum supergroup, where each topic maps to one
+workspace folder. This is the multi-project mode: topics run Claude in parallel
+in different folders, each with its own session.
+
+Setup:
+
+1. Create a group and enable Topics in its settings (it becomes a forum
+   supergroup). Admin rights for the bot are optional.
+2. Add the bot to the group. `/setjoingroups` must be Enable and
+   `/setprivacy` must be Disable (see the BotFather section).
+3. Create a topic for each project (`#project-one`, `#project-two`, ...).
+4. In each topic, send `/bind <folder>` once. This creates
+   `BASE_DIR/<folder>` if needed and remembers that topic maps to it. A folder
+   can be bound to only one topic; `/bind` on a taken folder is refused, so
+   `/unbind` there first.
+
+After `/bind`, any plain text sent in that topic runs Claude Code in the bound
+folder, in parallel with other topics. `/list`, `/code`, `/status`, `/cancel`,
+and `/reset` all operate on the current topic's folder. `/unbind` detaches a
+topic from its folder. `/perm` and `/model` inside a topic set that folder's
+mode or model only (persisted in `permissions.json` and `models.json`); their
+private-chat forms set the global defaults.
+
+The General topic and private chats have no `message_thread_id`, so they fall
+back to the single active folder selected with `/switch`. The binding map lives
+in `topics.json` next to `bot.py`, gitignored like `sessions.json`.
 
 ## Claude Code setup
 
@@ -169,7 +199,8 @@ router handles the actual model backends and their keys, so neither the bot nor
 Claude Code needs those keys directly.
 
 The bot's `/model` command queries `http://127.0.0.1:20128/v1/models` to list
-what the router offers, then writes the chosen ID to `active_model.txt`.
+what the router offers, then writes the chosen ID to `active_model.txt` (the
+global default; a per-folder choice from inside a topic goes to `models.json`).
 
 ## Telegram setup (BotFather)
 
@@ -188,12 +219,14 @@ On success BotFather returns the token, shaped like
 `123456789:AA...rest-of-token`. Copy it. This is `BOT_TOKEN` in `.env`. Treat
 it like a password: it lets whoever holds it control the bot.
 
-### 2. Lock the bot to private chats
+### 2. Let the bot join groups
 
-This bot is remote code execution, so it should not be addable to groups by
-strangers.
+This bot is remote code execution, so keep it out of groups run by strangers.
+If you use it only in private chats, you can disable `/setjoingroups`. If you
+use forum topics, the bot must be addable to a group:
 
-- Send `/setjoingroups`, pick the bot, choose **Disable**.
+- Send `/setjoingroups`, pick the bot, choose **Enable** (needed for topics),
+  or **Disable** if the bot stays in private chats.
 
 ### 3. Set the command menu
 
@@ -202,6 +235,8 @@ Send `/setcommands`, pick the bot, and paste this list verbatim:
 ```
 projects - List folders in BASE_DIR; active one is marked
 switch - Switch active workspace: /switch <folder>
+bind - Bind this topic to a folder: /bind <folder>
+unbind - Unbind this topic from its folder
 reset - Clear conversation memory for a fresh start
 model - Show or switch active Claude model: /model [name]
 perm - Show or switch permission mode: /perm [dontAsk|bypassPermissions|plan]
@@ -214,12 +249,21 @@ help - Show the command menu
 
 This makes Telegram show a `/` button with these entries, matching the handlers
 the bot registers. `/start` is not in the list because the bot maps it to the
-same help screen.
+same help screen. `/bind` and `/unbind` only do anything inside a forum topic,
+but listing them here keeps the menu consistent.
 
-### 4. Other BotFather settings (optional)
+### 4. Turn off privacy mode (required for group prompts)
 
-- `/setprivacy` - leave it at the default (enabled). It only matters in groups,
-  and this bot should stay in private chats.
+By default a bot in a group has privacy mode on and only sees commands,
+mentions, and replies to its own messages. The whole point of this setup is to
+send plain-text prompts in a topic, so privacy mode must be off:
+
+- Send `/setprivacy`, pick the bot, choose **Disable**.
+
+This is what lets the bot receive every message in a topic, not just commands.
+
+### 5. Other BotFather settings (optional)
+
 - `/setdescription` and `/setabouttext` - the bot profile shown in chat. Useful
   but cosmetic.
 - `/setuserpic` - the bot's avatar. Also cosmetic.
@@ -227,7 +271,7 @@ same help screen.
 If the token ever leaks, revoke and reissue it with `/revoke` in BotFather, then
 update `.env` and restart the bot.
 
-### 5. Get your Telegram user ID
+### 6. Get your Telegram user ID
 
 The bot authorizes exactly one account. To find its numeric ID, message
 [@userinfobot](https://t.me/userinfobot) from the account you want to operate
@@ -438,11 +482,15 @@ The 9router service is installed the same way, with its own unit (shown in the
 ## Operating notes
 
 - **Model and permission mode are runtime state.** `/model` and `/perm` persist
-  to gitignored files, so they survive restarts but are not in the repo. Check
-  the current values with `/model` (no argument) and `/perm` (no argument).
-- **One run at a time.** The bot serializes Claude Code runs behind a lock. A
-  second message while a task runs gets a "task already in progress" reply
-  rather than queuing.
+  to gitignored files, so they survive restarts but are not in the repo. In a
+  private chat they write the global `active_model.txt` / `active_permission.txt`;
+  inside a topic they write per-folder `models.json` / `permissions.json`
+  overrides. Check the current values with `/model` (no argument) and `/perm`
+  (no argument).
+- **One run at a time, per folder.** The bot serializes Claude Code runs behind
+  a lock keyed by workspace directory. Two topics bound to different folders
+  run in parallel; a second message in the same folder while its task runs gets
+  a "task already in progress" reply rather than queuing.
 - **Restarts.** All `.env` constants are read at import time, so changing
   `.env` requires `sudo systemctl restart dikodingbot.service`. `/model` and
   `/perm` do not.
@@ -454,6 +502,31 @@ The 9router service is installed the same way, with its own unit (shown in the
   sudo systemctl restart dikodingbot.service
   ```
 
+## Troubleshooting: startup crash on a flaky network
+
+Right after `systemctl start`, the boot logs can show a traceback ending in
+`anyio.NoEventLoopError: Not currently running on any asynchronous event loop`
+and `ExtBot is not properly initialized`. This is not a bug in the bot.
+
+The sequence: PTB's polling bootstrap calls `delete_webhook`. When the Telegram
+API is returning transient errors (a `502 Bad Gateway` was observed on the
+production instance at the same moment), the `httpx` request path tears down
+half-finished connections, and httpcore's cancellation-shield cleanup calls
+`anyio` code that assumes a running event loop. The failure surfaces as a
+misleading `NoEventLoopError`, then the retry loop logs `Failed run number 3 of
+0. Aborting` and the process exits.
+
+systemd restarts the service (`Restart=always`, `RestartSec=10`) and, once the
+network settles, the next bootstrap succeeds with `Application started`. It is
+self-healing and only ever appears when the network is failing at startup.
+
+If you see it, check the cause rather than the symptom: confirm Telegram is
+reachable (`getWebhookInfo` should return quickly), then `systemctl restart
+dikodingbot.service` once the network is back. There is no code fix to apply;
+the only durable mitigations are to keep `Restart=always` and, if the flakiness
+is regular, raise `RestartSec` so a crash loop during an outage does not spin
+the CPU.
+
 ## Things worth adding later
 
 This document records the setup but not every operational topic. Candidates
@@ -461,11 +534,14 @@ for a follow-up section, in rough order of usefulness:
 
 - **Router model catalog** - which models 9router currently exposes and how to
   add a new one, since that is where model choice actually lives.
-- **Backup and restore** - `sessions.json`, `active_model.txt`, and
-  `active_permission.txt` are the only runtime state; a note on backing them up
-  and restoring after a fresh clone.
+- **Backup and restore** - `sessions.json`, `topics.json`, `models.json`,
+  `permissions.json`, `active_model.txt`, and `active_permission.txt` are the
+  runtime state; a note on backing them up and restoring after a fresh clone.
 - **Troubleshooting** - the two failure modes already fixed (an oversized
   `stream-json` line breaking the run, and the live preview starving the final
-  message under Telegram's rate limit) and the log lines to look for.
+  message under Telegram's rate limit) and the log lines to look for. The
+  startup `NoEventLoopError` is now covered in its own section above.
 - **Security checklist** - confirm 9router stays bound to `127.0.0.1`, rotate
-  the bot token on leak, keep the bot out of groups.
+  the bot token on leak, and review the group posture: the bot now joins groups
+  and runs with privacy mode off, so keep it out of groups run by strangers
+  even though the single-operator gate still rejects everyone else.

@@ -1,5 +1,7 @@
 # Environment files (real config + timestamped backups) - never commit.
 .env*
+# The annotated template ships; only the real .env and its backups are ignored.
+!.env.example
 
 # Timestamped backup rotations of any file (bot.py.bak-20260101-120000, …).
 *.bak-*
@@ -26,6 +28,12 @@ sessions.json
 sessions-test.json
 active_model.txt
 active_permission.txt
+topics.json
+topics-test.json
+permissions.json
+permissions-test.json
+models.json
+models-test.json
 
 # Editors / OS noise
 .DS_Store

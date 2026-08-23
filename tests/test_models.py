@@ -85,5 +85,30 @@ class LoadActiveModelTests(unittest.TestCase):
             self.assertEqual(mod.load_active_model(), "gh/claude-sonnet-5")
 
 
+class ModelOverridesTests(unittest.TestCase):
+    def test_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            overrides_file = os.path.join(tmp, "models.json")
+            mod = _fresh_models({"MODELS_FILE": overrides_file})
+            mapping = {"/base/a": "claude-sonnet-5"}
+            mod.save_model_overrides(mapping)
+            self.assertTrue(os.path.exists(overrides_file))
+            self.assertEqual(mod.load_model_overrides(), mapping)
+            self.assertFalse(os.path.exists(overrides_file + ".tmp"))
+
+    def test_missing_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = _fresh_models({"MODELS_FILE": os.path.join(tmp, "nope.json")})
+            self.assertEqual(mod.load_model_overrides(), {})
+
+    def test_corrupt_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            overrides_file = os.path.join(tmp, "models.json")
+            with open(overrides_file, "w") as f:
+                f.write("{not json")
+            mod = _fresh_models({"MODELS_FILE": overrides_file})
+            self.assertEqual(mod.load_model_overrides(), {})
+
+
 if __name__ == "__main__":
     unittest.main()

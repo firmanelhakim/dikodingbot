@@ -107,6 +107,74 @@ class PermissionPersistenceTests(unittest.TestCase):
                 self.assertNotIn(mode, bot_safe)
 
 
+class PermissionForTests(unittest.TestCase):
+    """``permission_for`` picks a folder's override or falls back to global."""
+
+    def setUp(self):
+        self.handlers = _fresh_handlers(tempfile.gettempdir())
+
+    def _state(self, global_mode="dontAsk", overrides=None):
+        return type(
+            "_State",
+            (),
+            {
+                "permission_mode": global_mode,
+                "permission_modes": dict(overrides or {}),
+            },
+        )()
+
+    def test_no_override_returns_global(self):
+        state = self._state(global_mode="plan")
+        self.assertEqual(self.handlers.permission_for(state, "/base/a"), "plan")
+
+    def test_override_wins_for_that_folder(self):
+        state = self._state(
+            global_mode="dontAsk", overrides={"/base/a": "bypassPermissions"}
+        )
+        self.assertEqual(
+            self.handlers.permission_for(state, "/base/a"), "bypassPermissions"
+        )
+
+    def test_other_folder_still_global(self):
+        state = self._state(
+            global_mode="dontAsk", overrides={"/base/a": "bypassPermissions"}
+        )
+        self.assertEqual(self.handlers.permission_for(state, "/base/b"), "dontAsk")
+
+
+class ModelForTests(unittest.TestCase):
+    """``model_for`` picks a folder's override or falls back to the global model."""
+
+    def setUp(self):
+        self.handlers = _fresh_handlers(tempfile.gettempdir())
+
+    def _state(self, global_model="gpt", overrides=None):
+        return type(
+            "_State",
+            (),
+            {
+                "active_model": global_model,
+                "model_overrides": dict(overrides or {}),
+            },
+        )()
+
+    def test_no_override_returns_global(self):
+        state = self._state(global_model="gpt")
+        self.assertEqual(self.handlers.model_for(state, "/base/a"), "gpt")
+
+    def test_override_wins_for_that_folder(self):
+        state = self._state(global_model="gpt", overrides={"/base/a": "claude"})
+        self.assertEqual(self.handlers.model_for(state, "/base/a"), "claude")
+
+    def test_other_folder_still_global(self):
+        state = self._state(global_model="gpt", overrides={"/base/a": "claude"})
+        self.assertEqual(self.handlers.model_for(state, "/base/b"), "gpt")
+
+    def test_returns_none_when_no_global_and_no_override(self):
+        state = self._state(global_model=None, overrides={})
+        self.assertIsNone(self.handlers.model_for(state, "/base/a"))
+
+
 class HelpFormattingTests(unittest.TestCase):
     def test_help_html_uses_html_tags_not_markdown(self):
         # The /help output uses HTML mode so it renders consistently with the
@@ -117,6 +185,67 @@ class HelpFormattingTests(unittest.TestCase):
         self.assertIn("<code>", html)
         # Markdown emphasis characters would render literally in HTML mode.
         self.assertNotIn("**", html)
+
+
+class ProjectsMarkerTests(unittest.TestCase):
+    """``/projects`` marks the current folder: the bound folder in a topic,
+    else the /switch-selected active folder."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.mkdir(os.path.join(self.tmp.name, "one"))
+        os.mkdir(os.path.join(self.tmp.name, "two"))
+        self.handlers = _fresh_handlers(self.tmp.name)
+
+    def _state(self, active_dir, topics):
+        return type("_State", (), {"active_dir": active_dir, "topics": topics})()
+
+    def _update(self, thread_id):
+        replies: list[str] = []
+
+        class _Message:
+            message_thread_id = thread_id
+
+            async def reply_text(self, text, **kwargs):
+                replies.append(text)
+
+        class _User:
+            id = 1
+
+        class _Update:
+            effective_user = _User()
+            message = _Message()
+
+        return _Update(), replies
+
+    async def _run(self, thread_id, active_dir, topics):
+        state = self._state(active_dir, topics)
+        update, replies = self._update(thread_id)
+        handler = self.handlers.make_projects_command(state)
+        await handler(update, None)
+        return replies[0]
+
+    def test_marks_bound_topic_folder(self):
+        asyncio = __import__("asyncio")
+        text = asyncio.run(
+            self._run(3, self.tmp.name, {"3": os.path.join(self.tmp.name, "two")})
+        )
+        self.assertIn("✅ two", text)
+        self.assertIn("  • one", text)
+
+    def test_marks_active_folder_when_no_topic(self):
+        asyncio = __import__("asyncio")
+        text = asyncio.run(
+            self._run(None, os.path.join(self.tmp.name, "one"), {})
+        )
+        self.assertIn("✅ one", text)
+        self.assertIn("  • two", text)
+
+    def test_unbound_topic_marks_nothing(self):
+        asyncio = __import__("asyncio")
+        text = asyncio.run(self._run(99, self.tmp.name, {}))
+        self.assertNotIn("✅", text)
 
 
 if __name__ == "__main__":
