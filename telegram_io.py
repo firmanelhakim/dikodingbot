@@ -33,6 +33,80 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _now() -> float:
+    """Monotonic-ish wall clock in seconds. Split out so tests can control it."""
+    return dtm.datetime.now().timestamp()
+
+
+class _TokenBucket:
+    """A per-chat token bucket shared by every send and edit.
+
+    One token is consumed per outbound API call (a message or a live-preview
+    edit; the file-upload fallback is rare and left outside the budget). The
+    bucket refills at a fixed rate up to a burst ceiling, so a single run that
+    sends slowly never waits, while two runs in the same chat are throttled
+    toward a shared sustainable rate rather than tripping 429.
+    """
+
+    def __init__(self, rate: float, burst: float) -> None:
+        self._rate = rate / 60.0  # tokens per second
+        self._burst = burst
+        self._tokens = burst
+        self._updated = _now()
+        self._lock = asyncio.Lock()
+
+    def _refill(self, now: float) -> None:
+        self._tokens = min(self._burst, self._tokens + (now - self._updated) * self._rate)
+        self._updated = now
+
+    async def acquire(self) -> None:
+        """Wait until a token is available, then consume it."""
+        async with self._lock:
+            while True:
+                now = _now()
+                self._refill(now)
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                # Sleep until the next token would arrive, then re-check.
+                await asyncio.sleep((1.0 - self._tokens) / self._rate)
+
+
+# One bucket per chat_id. Lazy so tests and single-chat runs create exactly one.
+_buckets: dict[int, _TokenBucket] = {}
+
+
+def get_bucket(chat_id: int) -> _TokenBucket:
+    """Return the pacing bucket for ``chat_id``, creating it on first use."""
+    bucket = _buckets.get(chat_id)
+    if bucket is None:
+        bucket = _buckets[chat_id] = _TokenBucket(
+            config.SEND_RATE_LIMIT, config.SEND_RATE_BURST
+        )
+    return bucket
+
+
+def _chat_id_of(update: Update) -> int | None:
+    """Best-effort chat id for an update, or None when it cannot be found.
+
+    ``update.message.chat_id`` is the normal path. Some update shapes
+    (callback queries, edits) lack a plain message; pacing degrades to a
+    per-update bucket rather than failing the send.
+    """
+    msg = getattr(update, "effective_message", None)
+    if msg is not None:
+        return getattr(msg, "chat_id", None)
+    return None
+
+
+async def _pace(update: Update) -> None:
+    """Acquire a token for this update's chat before an outbound call."""
+    chat_id = _chat_id_of(update)
+    if chat_id is None:
+        return
+    await get_bucket(chat_id).acquire()
+
+
 def _retry_seconds(err: RetryAfter) -> float:
     """Seconds to wait for a RetryAfter error.
 
@@ -51,7 +125,11 @@ async def _send_with_retry(update: Update, text: str, parse_mode: str | None) ->
     Returns True if the message was delivered. Retries only on 429: the API
     tells us how long to wait, so waiting is the fix. Other errors are the
     caller's problem and are re-raised.
+
+    Takes a token from the chat's shared bucket first, so parallel topics in
+    one group do not collectively overrun the per-chat quota.
     """
+    await _pace(update)
     for attempt in range(config.SEND_MAX_RETRIES + 1):
         try:
             await update.message.reply_text(text, parse_mode=parse_mode)

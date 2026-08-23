@@ -51,6 +51,21 @@ MODEL_FILE = os.environ.get("MODEL_FILE", os.path.join(SCRIPT_DIR, "active_model
 # same way as MODEL_FILE, so a runtime switch survives a restart.
 PERMISSION_FILE = os.environ.get("PERMISSION_FILE", os.path.join(SCRIPT_DIR, "active_permission.txt"))
 
+# Persisted /bind selection: {thread_id: folder path}. One entry per topic,
+# written atomically the same way as SESSION_FILE. Empty until the operator
+# binds a topic.
+TOPICS_FILE = os.environ.get("TOPICS_FILE", os.path.join(SCRIPT_DIR, "topics.json"))
+
+# Persisted per-folder permission modes: {folder path: mode}. Only folders
+# that were given a mode via ``/perm`` in a topic appear here; every other
+# folder falls back to the global default from PERMISSION_FILE.
+PERMISSIONS_FILE = os.environ.get("PERMISSIONS_FILE", os.path.join(SCRIPT_DIR, "permissions.json"))
+
+# Persisted per-folder model overrides: {folder path: model id}. Only folders
+# that were given a model via ``/model`` in a topic appear here; every other
+# folder falls back to the global selection from MODEL_FILE / ANTHROPIC_MODEL.
+MODELS_FILE = os.environ.get("MODELS_FILE", os.path.join(SCRIPT_DIR, "models.json"))
+
 # --- Required ------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -95,6 +110,23 @@ SEND_MAX_RETRY_WAIT = _float_env("SEND_MAX_RETRY_WAIT", 60.0)
 # Pause between consecutive chunks of a long reply, to avoid tripping the rate
 # limit with our own burst.
 SEND_CHUNK_DELAY = _float_env("SEND_CHUNK_DELAY", 0.4)
+
+# --- Shared outbound pacing -----------------------------------------------
+#
+# The per-chat flood limit (~20 messages/minute) is shared by every topic in a
+# group, so with two runs streaming in parallel the previews alone can exhaust
+# the budget. The token bucket below is global per chat: sends and edits from
+# every run funnel through it, throttling under contention but leaving a single
+# run alone.
+
+# Tokens per minute for the shared bucket. At 19 the bucket still leaves
+# headroom for the 20/minute ceiling; one run at the default 4s edit interval
+# (~15/min) stays under it, while two runs sharing the chat are paced down.
+SEND_RATE_LIMIT = _float_env("SEND_RATE_LIMIT", 19.0)
+
+# Burst allowance above the sustained rate, so a short run or a multi-chunk
+# answer can go out immediately before settling into the rate.
+SEND_RATE_BURST = _float_env("SEND_RATE_BURST", 5.0)
 
 # Buffer cap for a single line of Claude's stream-json output. asyncio's own
 # default is 64 KiB, which one large tool result (a fetched web page, a big

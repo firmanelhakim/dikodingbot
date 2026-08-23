@@ -27,6 +27,7 @@ _BOT_MODULES = (
     "runner",
     "models",
     "handlers",
+    "topics",
 )
 
 

@@ -20,6 +20,7 @@ import config
 import handlers
 import models
 import session_store
+import topics
 from handlers import AppState
 
 from telegram.ext import (
@@ -49,6 +50,9 @@ def main() -> None:
         sessions=session_store.load_sessions(),
         active_model=models.load_active_model(),
         permission_mode=handlers.load_active_permission(),
+        topics=topics.load_topics(),
+        permission_modes=topics.load_permissions(),
+        model_overrides=models.load_model_overrides(),
     )
 
     # Startup banner. bypassPermissions gives Claude full local execution
@@ -71,11 +75,13 @@ def main() -> None:
 
     app.add_handler(CommandHandler("projects", handlers.make_projects_command(state)))
     app.add_handler(CommandHandler("switch", handlers.make_switch_command(state)))
+    app.add_handler(CommandHandler("bind", handlers.make_bind_command(state)))
+    app.add_handler(CommandHandler("unbind", handlers.make_unbind_command(state)))
     app.add_handler(CommandHandler("reset", handlers.make_reset_command(state)))
     app.add_handler(CommandHandler("model", handlers.make_model_command(state)))
     app.add_handler(CommandHandler("perm", handlers.make_permission_command(state)))
     app.add_handler(CommandHandler("status", handlers.make_status_command(state), block=False))
-    app.add_handler(CommandHandler("cancel", handlers.make_cancel_command(), block=False))
+    app.add_handler(CommandHandler("cancel", handlers.make_cancel_command(state), block=False))
     app.add_handler(CommandHandler("list", handlers.make_list_command(state)))
     app.add_handler(CommandHandler("help", handlers.help_command))
     app.add_handler(CommandHandler("start", handlers.help_command))

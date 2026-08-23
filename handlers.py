@@ -31,8 +31,9 @@ import models
 import runner
 import session_store
 import telegram_io
+import topics
 from auth import authorized
-from state import claude_lock, current_run
+from state import get_lock, get_run
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,16 @@ class AppState:
     active_model: str | None = None
     # The --permission-mode for future runs. Set by /perm; persisted via
     # ``save_active_permission``. Defaults to dontAsk, not bypassPermissions.
+    # This is the global default; a topic can override it per folder (below).
     permission_mode: str = config.DEFAULT_PERMISSION_MODE
+    # {thread_id: folder path}, set by /bind; persisted via ``topics.save_topics``.
+    topics: dict[str, str] = field(default_factory=dict)
+    # {folder path: permission mode}, set by /perm inside a topic. A folder with
+    # an entry here overrides the global default for runs in that folder only.
+    permission_modes: dict[str, str] = field(default_factory=dict)
+    # {folder path: model id}, set by /model inside a topic. A folder with an
+    # entry here overrides the global selection for runs in that folder only.
+    model_overrides: dict[str, str] = field(default_factory=dict)
 
 
 def _fmt_duration(seconds: int) -> str:
@@ -58,13 +68,13 @@ def _fmt_duration(seconds: int) -> str:
 
 
 def _inside_base(target: str) -> bool:
-    """True if ``target`` resolves inside ``BASE_DIR``."""
-    try:
-        common = os.path.normcase(os.path.commonpath([target, config.BASE_DIR]))
-    except ValueError:
-        # Different drives on Windows raise here; treat as rejection.
-        return False
-    return common == os.path.normcase(config.BASE_DIR)
+    """True if ``target`` resolves inside ``BASE_DIR``.
+
+    Wraps ``topics.confined_to`` so ``/switch`` uses the same realpath-based
+    check as ``/bind``, ``/list``, and ``/code``, which also rejects a symlink
+    that points outside the workspace.
+    """
+    return topics.confined_to(config.BASE_DIR, target)
 
 
 # --- Handler factories ---------------------------------------------------
@@ -93,9 +103,15 @@ def make_projects_command(state: AppState):
                 await update.message.reply_text(f"📂 No directories in {config.BASE_DIR}")
                 return
 
+            # The "current" folder is the topic's bound folder when in a topic,
+            # else the /switch-selected active folder. Same marker logic, so a
+            # topic shows which folder it is bound to.
+            current, _resolve_err = topics.resolve_dir(update, state)
+
             lines = [f"📂 Projects in {config.BASE_DIR}:\n"]
             for d in dirs:
-                marker = "✅" if os.path.join(config.BASE_DIR, d) == state.active_dir else "  •"
+                folder = os.path.join(config.BASE_DIR, d)
+                marker = "✅" if folder == current else "  •"
                 lines.append(f"{marker} {d}")
 
             await update.message.reply_text("\n".join(lines))
@@ -136,17 +152,111 @@ def make_switch_command(state: AppState):
     return switch_command
 
 
+def _topic_id(update: Update) -> str | None:
+    """Return the topic's id string for this update, or None for General/DM.
+
+    ``message_thread_id`` is None for the General topic and for private chats;
+    those have no topic to bind, so ``/bind`` must refuse them.
+    """
+    msg = getattr(update, "message", None)
+    thread_id = getattr(msg, "message_thread_id", None) if msg is not None else None
+    return None if thread_id is None else str(thread_id)
+
+
+def make_bind_command(state: AppState):
+    async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not authorized(update):
+            await update.message.reply_text("⛔ Unauthorized")
+            return
+
+        topic_id = _topic_id(update)
+        if topic_id is None:
+            await update.message.reply_text(
+                "⛔ /bind only works inside a forum topic. In a private chat or "
+                "the General topic, use /switch instead."
+            )
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /bind <folder>")
+            return
+
+        folder = context.args[0]
+        target_dir = os.path.abspath(os.path.join(config.BASE_DIR, folder))
+
+        if not _inside_base(target_dir):
+            await update.message.reply_text(
+                "⛔ Invalid path: Cannot bind outside the base workspace."
+            )
+            return
+
+        # A folder may be bound to at most one topic. Refuse rather than
+        # silently sharing a session and a lock between two topics.
+        existing = next(
+            (tid for tid, path in state.topics.items() if path == target_dir),
+            None,
+        )
+        if existing is not None and existing != topic_id:
+            await update.message.reply_text(
+                f"⛔ '{folder}' is already bound to another topic. "
+                f"Run /unbind in that topic first, or /bind a different folder."
+            )
+            return
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as e:
+            log.exception("bind_command: makedirs failed")
+            await update.message.reply_text(f"❌ Could not create {target_dir}: {e}")
+            return
+
+        state.topics[topic_id] = target_dir
+        topics.save_topics(state.topics)
+        await update.message.reply_text(f"✅ Bound this topic to {target_dir}.")
+
+    return bind_command
+
+
+def make_unbind_command(state: AppState):
+    async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not authorized(update):
+            await update.message.reply_text("⛔ Unauthorized")
+            return
+
+        topic_id = _topic_id(update)
+        if topic_id is None:
+            await update.message.reply_text(
+                "⛔ /unbind only works inside a forum topic."
+            )
+            return
+
+        if topic_id not in state.topics:
+            await update.message.reply_text("🔓 This topic is not bound to a folder.")
+            return
+
+        folder = state.topics.pop(topic_id)
+        topics.save_topics(state.topics)
+        await update.message.reply_text(f"🔓 Unbound this topic from {folder}.")
+
+    return unbind_command
+
+
 def make_reset_command(state: AppState):
     async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
-        # Take the lock so we don't delete a session while run_claude is using
-        # it.
-        async with claude_lock:
-            if state.active_dir in state.sessions:
-                del state.sessions[state.active_dir]
+        target, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        # Take the folder's lock so we don't delete a session while run_claude
+        # is using it.
+        async with get_lock(target):
+            if target in state.sessions:
+                del state.sessions[target]
                 session_store.save_sessions(state.sessions)
                 fresh = False
             else:
@@ -193,6 +303,16 @@ def save_active_permission(mode: str) -> None:
         log.error("Failed to save permission mode to %s: %s", config.PERMISSION_FILE, e)
 
 
+def permission_for(state: AppState, folder: str) -> str:
+    """Return the permission mode to use for ``folder``.
+
+    A per-folder mode set via ``/perm`` inside a topic wins; otherwise the
+    global default applies. The mode is chosen per run from the resolved
+    folder, so two topics can run under different modes at once.
+    """
+    return state.permission_modes.get(folder, state.permission_mode)
+
+
 def make_permission_command(state: AppState):
     async def permission_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
@@ -204,12 +324,26 @@ def make_permission_command(state: AppState):
         # hang the run, so we refuse them.
         bot_safe = ("bypassPermissions", "dontAsk", "plan")
 
-        # No argument → show current mode + what each option means.
+        # In a topic, /perm targets that topic's folder; elsewhere it targets
+        # the global default. Resolve the folder first so the display and the
+        # set agree on the same directory.
+        folder, resolve_err = topics.resolve_dir(update, state)
+        in_topic = _topic_id(update) is not None
+
+        # No argument → show the current mode + what each option means.
         if not context.args:
-            lines: list[str] = [f"⚙️ Current permission mode: {state.permission_mode}\n"]
+            if in_topic:
+                current = state.permission_modes.get(folder, state.permission_mode)
+                header = f"⚙️ Current permission mode for this topic: {current}"
+                if folder not in state.permission_modes:
+                    header += " (inherited from global)"
+            else:
+                current = state.permission_mode
+                header = f"⚙️ Current permission mode (global): {current}"
+            lines: list[str] = [header + "\n"]
             lines.append("Available modes:")
             for mode in config.PERMISSION_MODES:
-                marker = "✅" if mode == state.permission_mode else "  •"
+                marker = "✅" if mode == current else "  •"
                 hint = _PERMISSION_HINTS.get(mode, "")
                 if mode not in bot_safe:
                     hint += " ⚠️ (prompts - will hang a bot run)"
@@ -232,13 +366,21 @@ def make_permission_command(state: AppState):
             )
             return
 
-        async with claude_lock:
-            state.permission_mode = requested
-            save_active_permission(requested)
-
-        await update.message.reply_text(
-            f"✅ Permission mode set to {requested}. Next prompt will use it."
-        )
+        if in_topic:
+            async with get_lock(folder):
+                state.permission_modes[folder] = requested
+                topics.save_permissions(state.permission_modes)
+            await update.message.reply_text(
+                f"✅ Permission mode for this topic set to {requested}. "
+                f"Next prompt here will use it."
+            )
+        else:
+            async with get_lock(state.active_dir):
+                state.permission_mode = requested
+                save_active_permission(requested)
+            await update.message.reply_text(
+                f"✅ Permission mode (global) set to {requested}. Next prompt will use it."
+            )
 
     return permission_command
 
@@ -253,19 +395,42 @@ _PERMISSION_HINTS = {
 }
 
 
+def model_for(state: AppState, folder: str) -> str | None:
+    """Return the model id to use for ``folder``.
+
+    A per-folder override set via ``/model`` inside a topic wins; otherwise the
+    global selection applies. None means "let the CLI decide".
+    """
+    if folder in state.model_overrides:
+        return state.model_overrides[folder]
+    return state.active_model
+
+
 def make_model_command(state: AppState):
     async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
+        # In a topic, /model targets that topic's folder; elsewhere it targets
+        # the global selection.
+        folder, _resolve_err = topics.resolve_dir(update, state)
+        in_topic = _topic_id(update) is not None
+
         available, err = models.fetch_models()
 
         # No argument → show the current selection and the list.
         if not context.args:
             lines: list[str] = []
-            current = state.active_model or "(CLI default)"
-            lines.append(f"🧠 Current model: {current}")
+            if in_topic:
+                current = state.model_overrides.get(folder, state.active_model) or "(CLI default)"
+                header = f"🧠 Current model for this topic: {current}"
+                if folder not in state.model_overrides:
+                    header += " (inherited from global)"
+            else:
+                current = state.active_model or "(CLI default)"
+                header = f"🧠 Current model (global): {current}"
+            lines.append(header)
             if err:
                 lines.append(f"⚠️ {err}")
             lines.append("")
@@ -276,7 +441,7 @@ def make_model_command(state: AppState):
                 for m in available:
                     mid = m.get("id", "?")
                     owner = m.get("owned_by") or ""
-                    marker = "✅" if mid == state.active_model else "  •"
+                    marker = "✅" if mid == current else "  •"
                     suffix = f"  [{owner}]" if owner else ""
                     lines.append(f"{marker} {mid}{suffix}")
             # send_chunks - the list can exceed one Telegram message.
@@ -301,16 +466,24 @@ def make_model_command(state: AppState):
             )
             return
 
-        # Wait for any running claude subprocess so we don't swap the persisted
-        # model mid-run. A subprocess already running keeps the env it started
-        # with; the switch applies to the *next* run.
-        async with claude_lock:
-            state.active_model = requested
-            models.save_active_model(requested)
-
-        await update.message.reply_text(
-            f"✅ Model switched to {requested}. Next prompt will use it."
-        )
+        if in_topic:
+            # Wait for any running claude subprocess in this folder so we don't
+            # swap the persisted model mid-run.
+            async with get_lock(folder):
+                state.model_overrides[folder] = requested
+                models.save_model_overrides(state.model_overrides)
+            await update.message.reply_text(
+                f"✅ Model for this topic set to {requested}. Next prompt here will use it."
+            )
+        else:
+            # A subprocess already running keeps the env it started with; the
+            # switch applies to the *next* run.
+            async with get_lock(state.active_dir):
+                state.active_model = requested
+                models.save_active_model(requested)
+            await update.message.reply_text(
+                f"✅ Model (global) switched to {requested}. Next prompt will use it."
+            )
 
     return model_command
 
@@ -325,12 +498,18 @@ def make_message_handler(state: AppState):
         if not prompt:
             return
 
-        # If a task is already running, say so instead of quietly queueing
-        # behind the lock, which could block for the whole length of a long
-        # run.
-        if claude_lock.locked():
+        target, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        # If a task is already running in this folder, say so instead of
+        # quietly queueing behind the lock, which could block for the whole
+        # length of a long run. Another folder may run in parallel.
+        if get_lock(target).locked():
+            run = get_run(target)
             await update.message.reply_text(
-                f"⏳ A task is already in progress (PID: {current_run.pid}).\n\n"
+                f"⏳ A task is already in progress (PID: {run.pid}).\n\n"
                 "Use /status to check progress or /cancel to stop it."
             )
             return
@@ -343,8 +522,9 @@ def make_message_handler(state: AppState):
                 prompt,
                 state.sessions,
                 state.active_dir,
-                active_model=state.active_model,
-                permission_mode=state.permission_mode,
+                run_dir=target,
+                active_model=model_for(state, target),
+                permission_mode=permission_for(state, target),
             )
         except Exception as e:
             log.exception("handle_message failed")
@@ -361,9 +541,15 @@ def make_document_handler(state: AppState):
 
         document = update.message.document
 
-        if claude_lock.locked():
+        target, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        if get_lock(target).locked():
+            run = get_run(target)
             await update.message.reply_text(
-                f"⏳ A task is already in progress (PID: {current_run.pid}).\n\n"
+                f"⏳ A task is already in progress (PID: {run.pid}).\n\n"
                 "Use /status to check progress or /cancel to stop it."
             )
             return
@@ -375,10 +561,10 @@ def make_document_handler(state: AppState):
             )
             return
 
-        # Snapshot the workspace now and run Claude in that same directory, so
-        # a /switch arriving meanwhile can't put the file in one workspace and
-        # run in another.
-        target_dir = state.active_dir
+        # ``target`` is already the folder to run in, resolved from the topic.
+        # Snapshot it now so a /switch arriving meanwhile can't put the file in
+        # one workspace and run in another.
+        target_dir = target
 
         # Strip any directory components from the client-supplied name so an
         # upload can't write outside the workspace.
@@ -405,8 +591,8 @@ def make_document_handler(state: AppState):
             await runner.run_claude(
                 update, caption, state.sessions, state.active_dir,
                 run_dir=target_dir,
-                active_model=state.active_model,
-                permission_mode=state.permission_mode,
+                active_model=model_for(state, target_dir),
+                permission_mode=permission_for(state, target_dir),
             )
 
         except Exception as e:
@@ -422,20 +608,26 @@ def make_status_command(state: AppState):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
+        target, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        run = get_run(target)
         # If nothing is set yet but the lock is held, the task is starting up.
-        if current_run.proc is None and claude_lock.locked():
+        if run.proc is None and get_lock(target).locked():
             await update.message.reply_text("⏳ Task is currently starting up / initializing process...")
             return
 
-        proc = current_run.proc
-        start_time = current_run.start_time
+        proc = run.proc
+        start_time = run.start_time
         if proc is None or start_time is None:
             await update.message.reply_text("💤 No task is currently running.")
             return
 
         elapsed_txt = _fmt_duration(int(time.time() - start_time))
 
-        preview = (current_run.prompt or "").strip().replace("\n", " ")
+        preview = (run.prompt or "").strip().replace("\n", " ")
         if len(preview) > 200:
             preview = preview[:200] + "…"
 
@@ -443,8 +635,8 @@ def make_status_command(state: AppState):
         # make Telegram reject the message with a 400 and crash this handler.
         await update.message.reply_text(
             "🤖 Task in progress\n\n"
-            f"PID: {current_run.pid}\n"
-            f"Workspace: {current_run.run_dir or state.active_dir}\n"
+            f"PID: {run.pid}\n"
+            f"Workspace: {run.run_dir or target}\n"
             f"Elapsed: {elapsed_txt}\n"
             f"Prompt: {preview}\n\n"
             "Use /cancel to stop it."
@@ -453,14 +645,20 @@ def make_status_command(state: AppState):
     return status_command
 
 
-def make_cancel_command():
+def make_cancel_command(state: AppState):
     async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not authorized(update):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
-        proc = current_run.proc
-        pid = current_run.pid
+        target, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
+        run = get_run(target)
+        proc = run.proc
+        pid = run.pid
         if proc is None or pid is None:
             await update.message.reply_text("✅ No task to cancel.")
             return
@@ -616,6 +814,11 @@ def make_list_command(state: AppState):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
+        root, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
         subdir, recursive, depth, error = _parse_list_args(context.args or [])
         if error:
             await update.message.reply_text(error)
@@ -629,7 +832,7 @@ def make_list_command(state: AppState):
         else:
             depth = max(1, min(depth, _LIST_MAX_DEPTH))
 
-        target, error = _resolve_list_target(subdir, state.active_dir)
+        target, error = _resolve_list_target(subdir, root)
         if error:
             await update.message.reply_text(f"⛔ {error}")
             return
@@ -644,9 +847,11 @@ HELP_HTML = (
     "🤖 <b>dikodingbot Command Menu</b>\n\n"
     "• <code>/projects</code> - List all folders inside <code>BASE_DIR</code> and highlight active folder.\n"
     "• <code>/switch &lt;folder&gt;</code> - Switch active workspace to <code>BASE_DIR/&lt;folder&gt;</code>.\n"
+    "• <code>/bind &lt;folder&gt;</code> - In a topic, bind it to <code>BASE_DIR/&lt;folder&gt;</code>.\n"
+    "• <code>/unbind</code> - In a topic, detach it from its folder.\n"
     "• <code>/reset</code> - Clear active conversation memory for a fresh start.\n"
-    "• <code>/model [name]</code> - Show or switch the active Claude model via 9Router.\n"
-    "• <code>/perm [mode]</code> - Show or switch the Claude permission mode (default <code>dontAsk</code>).\n"
+    "• <code>/model [name]</code> - Show or switch the active Claude model via 9Router. In a topic it scopes to that folder; in a private chat it sets the global default.\n"
+    "• <code>/perm [mode]</code> - Show or switch the Claude permission mode (default <code>dontAsk</code>). In a topic it scopes to that folder; in a private chat it sets the global default.\n"
     "• <code>/status</code> - Show the running task's PID, elapsed time, and prompt.\n"
     "• <code>/cancel</code> - Stop the currently running task.\n"
     "• <code>/list</code> - List files in the active workspace.\n"
@@ -684,6 +889,12 @@ _CODE_EXCLUDED_FILES = frozenset(
         "sessions-test.json",
         "active_model.txt",
         "active_permission.txt",
+        "topics.json",
+        "topics-test.json",
+        "permissions.json",
+        "permissions-test.json",
+        "models.json",
+        "models-test.json",
     }
 )
 
@@ -776,7 +987,11 @@ def make_code_command(state: AppState):
             await update.message.reply_text("⛔ Unauthorized")
             return
 
-        root = state.active_dir
+        root, error = topics.resolve_dir(update, state)
+        if error:
+            await update.message.reply_text(f"⛔ {error}")
+            return
+
         if not os.path.isdir(root):
             await update.message.reply_text(
                 f"📂 Active workspace {root} not found."

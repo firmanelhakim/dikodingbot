@@ -2,8 +2,8 @@
 
 Runs ``claude`` in a chosen workspace, streams events back to Telegram, and
 saves the session UUID on success. All state changes go through
-``state.current_run`` so ``/status`` and ``/cancel`` can read an active
-process without taking the lock, which would block them behind the run.
+``state.runs`` so ``/status`` and ``/cancel`` can read an active process
+without taking the lock, which would block them behind the run.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from telegram import Update
 import config
 import session_store
 import telegram_io
-from state import claude_lock, current_run
+from state import get_lock, get_run
 
 log = logging.getLogger(__name__)
 
@@ -164,10 +164,10 @@ async def run_claude(
             Switchable at runtime via ``/perm`` without a bot restart; a run
             always keeps the mode it started with.
     """
-    async with claude_lock:
-        if run_dir is None:
-            run_dir = active_dir
+    if run_dir is None:
+        run_dir = active_dir
 
+    async with get_lock(run_dir):
         session_id, is_new_session = _pick_session(run_dir, sessions)
         session_flag = "--session-id" if is_new_session else "--resume"
 
@@ -203,9 +203,11 @@ async def run_claude(
         )
 
         task_start = time.time()
-        current_run.set(proc=proc, prompt=prompt, run_dir=run_dir, start_time=task_start)
+        get_run(run_dir).set(proc=proc, prompt=prompt, run_dir=run_dir, start_time=task_start)
 
-        streamer = _StreamState(proc=proc, status_msg=status_msg, task_start=task_start)
+        streamer = _StreamState(
+            proc=proc, status_msg=status_msg, task_start=task_start, update=update
+        )
 
         try:
             if config.CLAUDE_TIMEOUT > 0:
@@ -222,7 +224,7 @@ async def run_claude(
         except BaseException:
             # Any other failure in the read loop (including cancellation) would
             # otherwise leave claude running: start_new_session=True detaches
-            # it, and the finally block below clears current_run, so /cancel
+            # it, and the finally block below clears the run record, so /cancel
             # can no longer see it. Kill the group before propagating.
             log.exception("Claude run failed; terminating PID %s", proc.pid)
             await _kill_process_group(proc)
@@ -230,7 +232,7 @@ async def run_claude(
             raise
 
         finally:
-            current_run.clear()
+            get_run(run_dir).clear()
 
         dur_txt = _fmt_duration(int(time.time() - task_start))
         out = streamer.text().strip()
@@ -284,10 +286,12 @@ class _StreamState:
         proc: "asyncio.subprocess.Process",
         status_msg,
         task_start: float,
+        update=None,
     ) -> None:
         self.proc = proc
         self.status_msg = status_msg
         self.task_start = task_start
+        self.update = update
         self.accumulated: list[str] = []
         self.current_activity = "Thinking..."
         self._last_rendered: str | None = None
@@ -340,6 +344,8 @@ class _StreamState:
             if body == self._last_rendered:
                 continue
             try:
+                if self.update is not None:
+                    await telegram_io._pace(self.update)
                 await self.status_msg.edit_text(body, parse_mode="HTML")
                 self._last_rendered = body
             except Exception as e:
